@@ -29,12 +29,12 @@ from torch.utils.data import DataLoader, TensorDataset
 
 try:
     from .model import StrokeAutoencoder, StrokeLatentDiffusion
-    from .geometry import clothoid_bbox, place_clothoids
+    from .geometry import clothoid_bbox, place_clothoids, sample_clothoid_params
     from .render import render_strokes
     from .vector_data import SVGClothoidDataset
 except ImportError:
     from model import StrokeAutoencoder, StrokeLatentDiffusion
-    from geometry import clothoid_bbox, place_clothoids
+    from geometry import clothoid_bbox, place_clothoids, sample_clothoid_params
     from render import render_strokes
     from vector_data import SVGClothoidDataset
 
@@ -145,17 +145,29 @@ def main():
         noisy = scheduler.add_noise(clean, noise, t)
         pred_noise = denoiser(noisy, t, cond)
         
-        # MSE loss — bbox weighted ×5, masked to active strokes only
+        # MSE noise loss — bbox weighted ×5, masked to active strokes
         err = (pred_noise - noise).square()
         err[..., 64:68] = err[..., 64:68] * valid[..., None] * 5.0
-        loss = err.mean()
+        noise_loss = err.mean()
+
+        # Chamfer geometric loss: decode x0, sample points, compute CD
+        abar = scheduler.alphas_cumprod[t].to(device)[:, None, None]
+        x0_hat = (noisy - (1.0 - abar).sqrt() * pred_noise) / abar.sqrt().clamp_min(1e-4)
+        with torch.no_grad():
+            target_params, _ = ae.decode(clean[..., :64])
+            target_pts = sample_clothoid_params(target_params, samples=16)
+        pred_params, _ = ae.decode(x0_hat[..., :64])
+        pred_pts = sample_clothoid_params(pred_params, samples=16)
+        # CD masked to active strokes
+        valid_pts = valid[..., None, None]
+        d2 = ((pred_pts.unsqueeze(3) - target_pts.unsqueeze(2)) ** 2).sum(-1)
+        cd = ((d2.min(-1).values + d2.min(-2).values) * valid_pts).sum() / valid.sum().clamp_min(1.0) / 2.0
+        loss = noise_loss + 0.1 * cd
         opt.zero_grad(set_to_none=True); loss.backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 0.1)); opt.step()
 
         if step == 1 or step % args.log_every == 0 or step == args.steps:
             with torch.no_grad():
-                abar = scheduler.alphas_cumprod[t].to(device)[:, None, None]
-                x0_hat = (noisy - (1.0 - abar).sqrt() * pred_noise) / abar.sqrt().clamp_min(1e-4)
                 shape_mse = float(((((x0_hat[..., :64] - clean[..., :64]).square()) * valid[..., None]).sum() / valid.sum().clamp_min(1.0) / 64))
                 # bbox_mse in normalized space (also masked for active strokes)
                 bbox_err = ((x0_hat[..., 64:68] - clean[..., 64:68]).square() * valid[..., None])
@@ -168,6 +180,8 @@ def main():
 
                 row = {
                     "step": step, "loss": float(loss),
+                    "noise_loss": float(noise_loss),
+                    "chamfer": float(cd),
                     "t_mean": float(t.float().mean()),
                     "x0_shape_mse": shape_mse,
                     "x0_bbox_mse_n": bbox_mse_n,
