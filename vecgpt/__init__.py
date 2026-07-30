@@ -1,1 +1,0 @@
-"""VecGPT clothoid module stub."""
