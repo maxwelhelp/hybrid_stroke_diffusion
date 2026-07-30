@@ -93,13 +93,7 @@ def main():
             p = ds.tensors[0][i:i+128].to(device)
             v = ds.tensors[1][i:i+128].to(device)
             bb = clothoid_bbox(p)
-            # Filter out invalid bboxes (zero width/height or NaN)
-            valid_bb = (bb[..., 2] > 1e-6) & (bb[..., 3] > 1e-6)
-            bb_filtered = bb[v > 0.5][valid_bb[v > 0.5]]
-            if bb_filtered.numel() > 0:
-                bb_all.append(bb_filtered)
-    if len(bb_all) == 0:
-        raise RuntimeError("No valid bounding boxes found in dataset!")
+            bb_all.append(bb[v > 0.5])
     bb_all = torch.cat(bb_all)
     bb_mean = bb_all.mean(0)  # [cx, cy, w, h]
     bb_std = bb_all.std(0).clamp_min(0.01)

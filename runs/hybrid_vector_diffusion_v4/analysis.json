@@ -1,0 +1,33 @@
+{
+  "rows": 151,
+  "last": {
+    "step": 15000,
+    "diffusion_loss": 0.04089365527033806,
+    "t_mean": 557.59375,
+    "noise_mse_active": 0.0,
+    "noise_mse_inactive": 0.11868273466825485,
+    "x0_shape_mse": 0.0,
+    "x0_bbox_mse": 0.0,
+    "presence_sign_acc": 0.8447265625,
+    "presence_active_recall": 0.0,
+    "presence_inactive_rejection": 0.224609375,
+    "active_count_mean": 0.0,
+    "grad_norm": 0.13751909136772156
+  },
+  "recent_means": {
+    "diffusion_loss": 0.0491210138425231,
+    "noise_mse_active": 0.0,
+    "noise_mse_inactive": 0.19432370290160178,
+    "x0_shape_mse": 0.0,
+    "x0_bbox_mse": 0.0,
+    "presence_sign_acc": 0.85087890625,
+    "presence_active_recall": 0.0,
+    "presence_inactive_rejection": 0.33720703125,
+    "active_count_mean": 0.0,
+    "grad_norm": 0.1296987935900688
+  },
+  "diagnosis": [
+    "presence channel is not separating active/inactive strokes",
+    "padded strokes dominate the loss"
+  ]
+}

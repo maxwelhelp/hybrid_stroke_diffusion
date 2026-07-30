@@ -1,0 +1,17 @@
+{
+  "device": "cuda",
+  "max_strokes": 64,
+  "ae": {
+    "step": 1500,
+    "ae_loss": 0.020480239763855934,
+    "geom": 0.01467266958206892,
+    "curve": 0.0007331899250857532,
+    "udf": 0.009639947675168514,
+    "presence": 0.00386240822263062
+  },
+  "ae_eval_geom": 0.0015983990160748363,
+  "render_finite": true,
+  "diffusion_final_loss": 0.1532607227563858,
+  "udf": "vector probe-distance signature, not a generated pixel image",
+  "passed": true
+}
