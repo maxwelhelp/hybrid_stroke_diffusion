@@ -29,12 +29,19 @@ def sample_clothoid_params(params: torch.Tensor, samples: int = 24) -> torch.Ten
 
 
 def clothoid_bbox(params: torch.Tensor, samples: int = 24) -> torch.Tensor:
-    """Return normalized center/size of each curve for the joint diffusion state."""
+    """Return normalized center/size of each curve for the joint diffusion state.
+    
+    Uses log-scale for width/height to improve gradient flow and prevent
+    numerical instability from very small or large bboxes.
+    """
     pts = sample_clothoid_params(params, samples)
     mn, mx = pts.amin(-2), pts.amax(-2)
     center = (mn + mx) * 0.5
     size = (mx - mn).clamp_min(1e-4)
-    return torch.cat((center, size), -1)
+    # Apply log transform to size for better conditioning
+    # This prevents the model from predicting extreme values
+    log_size = torch.log(size + 1e-6)
+    return torch.cat((center, log_size), -1)
 
 
 def place_clothoids(params: torch.Tensor, target_bbox: torch.Tensor) -> torch.Tensor:
@@ -43,9 +50,14 @@ def place_clothoids(params: torch.Tensor, target_bbox: torch.Tensor) -> torch.Te
     Only repositions strokes; does NOT rescale curvature/length.
     Scaling kappa/delta_kappa creates numerical explosions when the DDPM
     produces inconsistently sized latent-bbox pairs.
+    
+    Note: target_bbox uses log-scale for size (dimensions 2:4), so we
+    need to exp() them back to linear scale before using.
     """
     out = params.clone()
     old = clothoid_bbox(out)
+    # target_bbox[..., :2] are centers (linear), [..., 2:4] are log-sizes
+    # We only use the center difference for translation
     out[..., :2] = out[..., :2] + (target_bbox[..., :2] - old[..., :2])
     return out
 
