@@ -95,19 +95,10 @@ def main():
             bb = clothoid_bbox(p)
             bb_all.append(bb[v > 0.5])
     bb_all = torch.cat(bb_all)
-    bb_mean = bb_all.mean(0)  # [cx, cy, w, h]
-    bb_std = bb_all.std(0).clamp_min(0.01)
-    
-    # Apply log transform to width and height for better scale handling
-    # Store original stats for denormalization
-    bb_mean_log = bb_mean.clone()
-    bb_std_log = bb_std.clone()
-    bb_mean_log[2:] = torch.log(bb_mean[2:].clamp_min(1e-6))
-    # For log std, use delta method approximation or empirical
-    bb_std_log[2:] = (bb_std[2:] / bb_mean[2:].clamp_min(1e-6)).clamp_min(0.01)
-    
-    print(f"bbox mean (orig): {bb_mean.tolist()}  std: {bb_std.tolist()}", flush=True)
-    print(f"bbox mean (log w,h): {bb_mean_log.tolist()}  std: {bb_std_log.tolist()}", flush=True)
+    # clothoid_bbox() already returns [cx, cy, log_w, log_h] — NO extra log needed
+    bb_mean_log = bb_all.mean(0)
+    bb_std_log = bb_all.std(0).clamp_min(0.01)
+    print(f"bbox mean (cx,cy,log_w,log_h): {bb_mean_log.tolist()}  std: {bb_std_log.tolist()}", flush=True)
 
     cond_dim = len(categories) if args.conditioned else 0
     state_dim = 68  # latent(64) + bbox(4)
@@ -140,12 +131,8 @@ def main():
         valid = valid.gather(1, perm)
         with torch.no_grad():
             z = ae.encode(params)
-            bbox = clothoid_bbox(params)
-            # Apply log transform to w,h before normalization
-            bbox_log = bbox.clone()
-            bbox_log[..., 2:] = torch.log(bbox[..., 2:].clamp_min(1e-6))
-            # Normalize bbox to N(0,1) per channel using log-stats for w,h
-            bbox_n = (bbox_log - bb_mean_log.to(device)) / bb_std_log.to(device)
+            bbox = clothoid_bbox(params)  # [cx, cy, log_w, log_h] — already log-scaled
+            bbox_n = (bbox - bb_mean_log.to(device)) / bb_std_log.to(device)
             # Check for NaN/Inf
             has_nan = torch.isnan(bbox_n).any() or torch.isinf(bbox_n).any()
             if has_nan:
@@ -199,7 +186,7 @@ def main():
             if step % 500 == 0 or step == args.steps or step == 1:
                 torch.save({"model": denoiser.state_dict(), "ae_checkpoint": args.ae_checkpoint,
                             "config": vars(args), "history": history,
-                            "bb_mean": bb_mean, "bb_std": bb_std},
+                            "bb_mean_log": bb_mean_log, "bb_std_log": bb_std_log},
                            out / "latest.pt")
 
     # Sampling
