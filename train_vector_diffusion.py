@@ -245,13 +245,21 @@ def main():
 
         generated, presence_logits = ae.decode(x_final[..., :64])
         generated = place_clothoids(generated, x_final[..., 64:68])
+        # Clean NaN/Inf from generated params before rendering
+        if not torch.isfinite(generated).all():
+            print("Warning: NaN/Inf in generated params, clamping...", flush=True)
+            generated = torch.nan_to_num(generated, nan=0.0, posinf=1.0, neginf=-1.0)
         presence_prob = torch.sigmoid(presence_logits)
         target_strokes = 15
         generated_valid = torch.zeros_like(presence_prob).scatter_(1,
             presence_prob.topk(target_strokes, dim=-1).indices, 1.0)
 
         import matplotlib.pyplot as plt
-        imgs = render_strokes(generated, generated_valid, size=192, curve_samples=32).clamp(0, 1).cpu()
+        try:
+            imgs = render_strokes(generated, generated_valid, size=192, curve_samples=32).clamp(0, 1).cpu()
+        except Exception as e:
+            print(f"Render failed: {e}, using blank images", flush=True)
+            imgs = torch.zeros(generated.shape[0], 192, 192, 3)
         target_item = ds[0]
         tp, tv = target_item[:2]
         tp, tv = tp[None].to(device), tv[None].to(device)
