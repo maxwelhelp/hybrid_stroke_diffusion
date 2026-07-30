@@ -103,7 +103,7 @@ def main():
     cond_dim = len(categories) if args.conditioned else 0
     state_dim = 68  # latent(64) + bbox(4)
     denoiser = StrokeLatentDiffusion(latent_dim=state_dim, model_dim=256, layers=6, heads=8,
-                                     cond_dim=cond_dim, use_pos=True).to(device)
+                                     cond_dim=cond_dim, use_pos=False).to(device)
     if args.resume:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
         denoiser.load_state_dict(saved["model"], strict=True)
@@ -239,10 +239,7 @@ def main():
         if not torch.isfinite(generated).all():
             print("Warning: NaN/Inf in generated params, clamping...", flush=True)
             generated = torch.nan_to_num(generated, nan=0.0, posinf=1.0, neginf=-1.0)
-        presence_prob = torch.sigmoid(presence_logits)
-        target_strokes = 15
-        generated_valid = torch.zeros_like(presence_prob).scatter_(1,
-            presence_prob.topk(target_strokes, dim=-1).indices, 1.0)
+        generated_valid = (torch.sigmoid(presence_logits) > 0.5).float()
 
         import matplotlib.pyplot as plt
         try:
