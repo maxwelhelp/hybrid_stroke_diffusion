@@ -1,10 +1,19 @@
 #!/usr/bin/env python
-"""Train latent stroke diffusion — v6.
+"""Train latent stroke diffusion — v9.1.
 
 DDPM diffuses [latent(64) | bbox(4)] = 68 dims. Bbox is normalized
 to N(0,1) per channel for DDPM compatibility. Presence via AE decoder.
 CFG training (cond dropout 10%) but CFG scale=1.0 at sampling (disabled
 until conditioning converges).
+
+v9.1 fixes:
+- Log-scale w,h for better gradient flow (critical for size variance)
+- Huber loss for bbox to reduce outlier impact
+- Masked bbox loss (only active strokes)
+- Reduced bbox weight (0.5 instead of 1.0)
+- Stronger gradient clipping (0.25)
+- Lower learning rate (5e-5)
+- NaN/Inf checks in targets
 """
 
 from __future__ import annotations
@@ -84,11 +93,27 @@ def main():
             p = ds.tensors[0][i:i+128].to(device)
             v = ds.tensors[1][i:i+128].to(device)
             bb = clothoid_bbox(p)
-            bb_all.append(bb[v > 0.5])
+            # Filter out invalid bboxes (zero width/height or NaN)
+            valid_bb = (bb[..., 2] > 1e-6) & (bb[..., 3] > 1e-6)
+            bb_filtered = bb[v > 0.5][valid_bb[v > 0.5]]
+            if bb_filtered.numel() > 0:
+                bb_all.append(bb_filtered)
+    if len(bb_all) == 0:
+        raise RuntimeError("No valid bounding boxes found in dataset!")
     bb_all = torch.cat(bb_all)
     bb_mean = bb_all.mean(0)  # [cx, cy, w, h]
     bb_std = bb_all.std(0).clamp_min(0.01)
-    print(f"bbox mean: {bb_mean.tolist()}  std: {bb_std.tolist()}", flush=True)
+    
+    # Apply log transform to width and height for better scale handling
+    # Store original stats for denormalization
+    bb_mean_log = bb_mean.clone()
+    bb_std_log = bb_std.clone()
+    bb_mean_log[2:] = torch.log(bb_mean[2:].clamp_min(1e-6))
+    # For log std, use delta method approximation or empirical
+    bb_std_log[2:] = (bb_std[2:] / bb_mean[2:].clamp_min(1e-6)).clamp_min(0.01)
+    
+    print(f"bbox mean (orig): {bb_mean.tolist()}  std: {bb_std.tolist()}", flush=True)
+    print(f"bbox mean (log w,h): {bb_mean_log.tolist()}  std: {bb_std_log.tolist()}", flush=True)
 
     cond_dim = len(categories) if args.conditioned else 0
     state_dim = 68  # latent(64) + bbox(4)
@@ -98,11 +123,15 @@ def main():
         saved = torch.load(args.resume, map_location=device, weights_only=False)
         denoiser.load_state_dict(saved["model"], strict=True)
         print(f"loaded diffusion checkpoint: {args.resume}", flush=True)
-    opt = torch.optim.AdamW(denoiser.parameters(), lr=2e-4, weight_decay=1e-4)
+    opt = torch.optim.AdamW(denoiser.parameters(), lr=5e-5, weight_decay=1e-4)
     scheduler = DDPMScheduler(num_train_timesteps=1000)
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     it = iter(loader); history = []
     metrics_path = out / "train_metrics.jsonl"
+
+    # Bbox loss configuration
+    bbox_weight = 0.5  # Reduced from 1.0 to prevent domination
+    huber_delta = 0.3  # Huber loss delta for bbox (smaller = more L1-like)
 
     for step in range(1, args.steps + 1):
         try: batch = next(it)
@@ -122,28 +151,45 @@ def main():
         with torch.no_grad():
             z = ae.encode(params)
             bbox = clothoid_bbox(params)
-            # Normalize bbox to N(0,1) per channel
-            bbox_n = (bbox - bb_mean.to(device)) / bb_std.to(device)
+            # Apply log transform to w,h before normalization
+            bbox_log = bbox.clone()
+            bbox_log[..., 2:] = torch.log(bbox[..., 2:].clamp_min(1e-6))
+            # Normalize bbox to N(0,1) per channel using log-stats for w,h
+            bbox_n = (bbox_log - bb_mean_log.to(device)) / bb_std_log.to(device)
+            # Check for NaN/Inf
+            has_nan = torch.isnan(bbox_n).any() or torch.isinf(bbox_n).any()
+            if has_nan:
+                print(f"WARNING: NaN/Inf in normalized bbox at step {step}, skipping batch", flush=True)
+                continue
             clean = torch.cat((z, bbox_n), -1)
 
         t = torch.randint(0, scheduler.config.num_train_timesteps, (clean.shape[0],), device=device).long()
         noise = torch.randn_like(clean)
         noisy = scheduler.add_noise(clean, noise, t)
         pred_noise = denoiser(noisy, t, cond)
-        # Weight bbox dims x3 so model learns spatial structure
-        err = (pred_noise - noise).square()
-        err[..., 64:68] *= 3.0
-        loss = err.mean()
+        
+        # Compute loss with Huber for bbox and masking
+        err_shape = F.smooth_l1_loss(pred_noise[..., :64], noise[..., :64], reduction='none')
+        err_bbox = F.smooth_l1_loss(pred_noise[..., 64:68], noise[..., 64:68], reduction='none', beta=huber_delta)
+        
+        # Mask bbox loss only for active strokes to avoid learning noise on padded slots
+        err_bbox = err_bbox * valid[..., None]
+        err_bbox = err_bbox.sum() / (valid.sum().clamp_min(1.0) * 4)
+        
+        err_shape = err_shape.mean()
+        loss = err_shape + bbox_weight * err_bbox
+        
         opt.zero_grad(set_to_none=True); loss.backward()
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)); opt.step()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 0.25)); opt.step()
 
         if step == 1 or step % args.log_every == 0 or step == args.steps:
             with torch.no_grad():
                 abar = scheduler.alphas_cumprod[t].to(device)[:, None, None]
                 x0_hat = (noisy - (1.0 - abar).sqrt() * pred_noise) / abar.sqrt().clamp_min(1e-4)
                 shape_mse = float(((((x0_hat[..., :64] - clean[..., :64]).square()) * valid[..., None]).sum() / valid.sum().clamp_min(1.0) / 64))
-                # bbox_mse in normalized space
-                bbox_mse_n = float(((((x0_hat[..., 64:68] - clean[..., 64:68]).square()) * valid[..., None]).sum() / valid.sum().clamp_min(1.0) / 4))
+                # bbox_mse in normalized space (also masked for active strokes)
+                bbox_err = ((x0_hat[..., 64:68] - clean[..., 64:68]).square() * valid[..., None])
+                bbox_mse_n = float(bbox_err.sum() / (valid.sum().clamp_min(1.0) * 4))
                 z_hat = x0_hat[..., :64]
                 _, ae_logits = ae.decode(z_hat)
                 ae_presence = torch.sigmoid(ae_logits)
@@ -188,16 +234,19 @@ def main():
         for t in scheduler.timesteps:
             tt = torch.full((n,), int(t), device=device, dtype=torch.long)
             eps = denoiser(x, tt, preview_cond)
-            # CFG: amplify conditioning
+            # CFG: mildly amplify conditioning (reduced from 2.0 to 1.5 for stability)
             if args.conditioned:
                 zero_cond = torch.zeros_like(preview_cond)
                 eps_uncond = denoiser(x, tt, zero_cond)
-                eps = eps_uncond + 2.0 * (eps - eps_uncond)
+                cfg_scale = 1.5  # Reduced from 2.0
+                eps = eps_uncond + cfg_scale * (eps - eps_uncond)
             x = scheduler.step(eps, t, x).prev_sample
 
         # Denormalize bbox
         x_final = x.clone()
-        x_final[..., 64:68] = x[..., 64:68] * bb_std.to(device) + bb_mean.to(device)
+        # Denormalize bbox: first linear, then exp for w,h
+        x_final[..., 64:68] = x[..., 64:68] * bb_std_log.to(device) + bb_mean_log.to(device)
+        x_final[..., 2+2:4+2] = torch.exp(x_final[..., 2+2:4+2])  # exp(w), exp(h)
 
         generated, presence_logits = ae.decode(x_final[..., :64])
         generated = place_clothoids(generated, x_final[..., 64:68])
