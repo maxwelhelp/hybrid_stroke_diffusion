@@ -117,15 +117,11 @@ def main():
         saved = torch.load(args.resume, map_location=device, weights_only=False)
         denoiser.load_state_dict(saved["model"], strict=True)
         print(f"loaded diffusion checkpoint: {args.resume}", flush=True)
-    opt = torch.optim.AdamW(denoiser.parameters(), lr=5e-5, weight_decay=1e-4)
+    opt = torch.optim.AdamW(denoiser.parameters(), lr=2e-5, weight_decay=1e-4)
     scheduler = DDPMScheduler(num_train_timesteps=1000)
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     it = iter(loader); history = []
     metrics_path = out / "train_metrics.jsonl"
-
-    # Bbox loss configuration
-    bbox_weight = 0.5  # Reduced from 1.0 to prevent domination
-    huber_delta = 0.3  # Huber loss delta for bbox (smaller = more L1-like)
 
     for step in range(1, args.steps + 1):
         try: batch = next(it)
@@ -162,19 +158,12 @@ def main():
         noisy = scheduler.add_noise(clean, noise, t)
         pred_noise = denoiser(noisy, t, cond)
         
-        # Compute loss with Huber for bbox and masking
-        err_shape = F.smooth_l1_loss(pred_noise[..., :64], noise[..., :64], reduction='none')
-        err_bbox = F.smooth_l1_loss(pred_noise[..., 64:68], noise[..., 64:68], reduction='none', beta=huber_delta)
-        
-        # Mask bbox loss only for active strokes to avoid learning noise on padded slots
-        err_bbox = err_bbox * valid[..., None]
-        err_bbox = err_bbox.sum() / (valid.sum().clamp_min(1.0) * 4)
-        
-        err_shape = err_shape.mean()
-        loss = err_shape + bbox_weight * err_bbox
-        
+        # MSE loss — bbox weighted ×5, masked to active strokes only
+        err = (pred_noise - noise).square()
+        err[..., 64:68] = err[..., 64:68] * valid[..., None] * 5.0
+        loss = err.mean()
         opt.zero_grad(set_to_none=True); loss.backward()
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 0.25)); opt.step()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 0.1)); opt.step()
 
         if step == 1 or step % args.log_every == 0 or step == args.steps:
             with torch.no_grad():
