@@ -158,10 +158,10 @@ def main():
             target_pts = sample_clothoid_params(target_params, samples=16)
         pred_params, _ = ae.decode(x0_hat[..., :64])
         pred_pts = sample_clothoid_params(pred_params, samples=16)
-        # CD masked to active strokes
-        valid_pts = valid[..., None, None]
-        d2 = ((pred_pts.unsqueeze(3) - target_pts.unsqueeze(2)) ** 2).sum(-1)
-        cd = ((d2.min(-1).values + d2.min(-2).values) * valid_pts).sum() / valid.sum().clamp_min(1.0) / 2.0
+        # CD: per-stroke mean over 16 points, masked to active strokes
+        d2 = ((pred_pts.unsqueeze(3) - target_pts.unsqueeze(2)) ** 2).sum(-1)  # [B,N,16,16]
+        cd_per_stroke = d2.min(-1).values.mean(-1) + d2.min(-2).values.mean(-1)  # [B,N]
+        cd = (cd_per_stroke * valid).sum() / valid.sum().clamp_min(1.0) / 2.0
         loss = noise_loss + 0.1 * cd
         opt.zero_grad(set_to_none=True); loss.backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 0.1)); opt.step()
