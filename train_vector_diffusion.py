@@ -242,11 +242,12 @@ def main():
                 eps = eps_uncond + cfg_scale * (eps - eps_uncond)
             x = scheduler.step(eps, t, x).prev_sample
 
-        # Denormalize bbox
-        x_final = x.clone()
         # Denormalize bbox: first linear, then exp for w,h
+        x_final = x.clone()
         x_final[..., 64:68] = x[..., 64:68] * bb_std_log.to(device) + bb_mean_log.to(device)
-        x_final[..., 2+2:4+2] = torch.exp(x_final[..., 2+2:4+2])  # exp(w), exp(h)
+        # Exp only log_w, log_h at indices 66:68 (NOT 4:6 which are latents!)
+        log_wh = x_final[..., 66:68].clamp(-10, 10)
+        x_final[..., 66:68] = torch.exp(log_wh)
 
         generated, presence_logits = ae.decode(x_final[..., :64])
         generated = place_clothoids(generated, x_final[..., 64:68])
