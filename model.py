@@ -100,11 +100,10 @@ class StrokeAutoencoder(nn.Module):
 
 
 class StrokeLatentDiffusion(nn.Module):
-    """Transformer denoiser over padded stroke latents.
+    """Transformer denoiser with adaLN conditioning (DiT-style).
 
-    Architecture follows StrokeFusion: plain self-attention Transformer
-    over a fixed-length padded sequence, no separate count head.
-    Cardinality is determined by the diffused presence flag (flag > 0).
+    Time + class embeddings modulate layer norm in every transformer block
+    via learned scale/shift/gate. Gate initialized to zero (adaLN-zero).
     """
 
     def __init__(self, latent_dim: int = 64, model_dim: int = 128, layers: int = 4, heads: int = 4, cond_dim: int = 0, use_pos: bool = True):
@@ -112,22 +111,72 @@ class StrokeLatentDiffusion(nn.Module):
         self.latent_dim = latent_dim
         self.model_dim = model_dim
         self.in_proj = nn.Linear(latent_dim, model_dim)
-        self.time = nn.Sequential(SinusoidalTime(model_dim), nn.Linear(model_dim, model_dim), nn.SiLU())
-        self.cond = nn.Linear(cond_dim, model_dim) if cond_dim else None
+        self.time_emb = nn.Sequential(SinusoidalTime(model_dim), nn.Linear(model_dim, model_dim), nn.SiLU())
+        self.cond_emb = nn.Linear(cond_dim, model_dim) if cond_dim else None
         self.use_pos = use_pos
         self.pos = nn.Parameter(torch.randn(1, 256, model_dim) * 0.01)
-        block = nn.TransformerEncoderLayer(model_dim, heads, 4 * model_dim, batch_first=True, norm_first=False, dropout=0.1, activation='gelu')
-        self.net = nn.TransformerEncoder(block, layers)
+
+        self.layers = nn.ModuleList([
+            AdaLNTransformerBlock(model_dim, heads, 4 * model_dim) for _ in range(layers)
+        ])
+        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(model_dim, 6 * model_dim))
+        self.norm_final = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.out = nn.Linear(model_dim, latent_dim)
 
+        # adaLN-zero: zero-initialize the final layer of adaLN
+        nn.init.constant_(self.adaLN[-1].weight, 0)
+        nn.init.constant_(self.adaLN[-1].bias, 0)
+
     def forward(self, noisy: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None):
-        h = self.in_proj(noisy) + self.time(t)[:, None]
+        h = self.in_proj(noisy)
         if self.use_pos:
             h = h + self.pos[:, : noisy.shape[1]]
-        if self.cond is not None and cond is not None:
-            h = h + self.cond(cond)[:, None] * 2.0
-        h = self.net(h)
+
+        # Build conditioning from time + optional class
+        c = self.time_emb(t)[:, None]  # [B, 1, D]
+        if self.cond_emb is not None and cond is not None:
+            c = c + self.cond_emb(cond)[:, None]
+        c = self.adaLN(c)  # [B, 1, 6*D]
+
+        for layer in self.layers:
+            h = layer(h, c)
+
+        h = self.norm_final(h)
         return self.out(h)
+
+
+class AdaLNTransformerBlock(nn.Module):
+    """Transformer block with adaptive layer norm (DiT-style)."""
+
+    def __init__(self, dim: int, heads: int, ff_dim: int):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.ff = nn.Sequential(nn.Linear(dim, ff_dim), nn.GELU(), nn.Linear(ff_dim, dim))
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor):
+        # c shape: [B, 1, 6*dim] — scale1, shift1, gate1, scale2, shift2, gate2
+        B, S, D = x.shape
+        scale1, shift1, gate1, scale2, shift2, gate2 = c.chunk(6, dim=-1)
+        # Broadcast over sequence
+        s1 = (1 + scale1).expand(-1, S, -1)
+        sh1 = shift1.expand(-1, S, -1)
+        g1 = gate1.expand(-1, S, -1)
+        s2 = (1 + scale2).expand(-1, S, -1)
+        sh2 = shift2.expand(-1, S, -1)
+        g2 = gate2.expand(-1, S, -1)
+
+        # Block 1: attention
+        norm_x = s1 * self.norm1(x) + sh1
+        attn_out, _ = self.attn(norm_x, norm_x, norm_x)
+        x = x + g1 * attn_out
+
+        # Block 2: FFN
+        norm_x = s2 * self.norm2(x) + sh2
+        ff_out = self.ff(norm_x)
+        x = x + g2 * ff_out
+        return x
 
 
 def diffusion_loss(denoiser: StrokeLatentDiffusion, clean: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
