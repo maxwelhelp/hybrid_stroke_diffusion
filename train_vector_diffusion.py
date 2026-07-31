@@ -239,7 +239,11 @@ def main():
         if not torch.isfinite(generated).all():
             print("Warning: NaN/Inf in generated params, clamping...", flush=True)
             generated = torch.nan_to_num(generated, nan=0.0, posinf=1.0, neginf=-1.0)
-        generated_valid = (torch.sigmoid(presence_logits) > 0.5).float()
+        # Take top-5 strokes by AE presence probability (QuickDraw avg ~5.3)
+        presence_prob = torch.sigmoid(presence_logits)
+        k = 5
+        generated_valid = torch.zeros_like(presence_prob).scatter_(1,
+            presence_prob.topk(k, dim=-1).indices, 1.0)
 
         import matplotlib.pyplot as plt
         try:
